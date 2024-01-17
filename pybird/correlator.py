@@ -293,8 +293,8 @@ class Correlator(object):
                 else: self.nnlo_counterterm.Ps(self.bird, ilogPsmooth)
             if not correlator_engine: self.nonlinear.PsCf(self.bird)
             elif correlator_engine: correlator_engine.nonlinear.PsCf(self.bird, c_alpha) # emu
-            if self.c["with_uvmatch_2"]: self.matching.UVPsCf(self.bird) 
-            if self.c["with_irmatch_2"]: self.matching.IRPsCf(self.bird) 
+            if self.c["with_uvmatch_2"]: self.matching.UVPsCf(self.bird)
+            if self.c["with_irmatch_2"]: self.matching.IRPsCf(self.bird)
             if self.c["with_bias"]: self.bird.setPsCf(self.bias)
             else: self.bird.setPsCfl()
             if self.c["with_resum"]:
@@ -378,7 +378,7 @@ class Correlator(object):
 
         self.co = Common(Nl=self.c["multipole"], kmin=self.c["kmin"], kmax=self.c["kmax"], km=self.c["km"], kr=self.c["kr"], nd=self.c["nd"], eft_basis=self.c["eft_basis"],
             halohalo=self.c["halohalo"], with_cf=self.c["with_cf"], with_time=self.c["with_time"], accboost=self.c["accboost"], optiresum=self.c["optiresum"],
-            exact_time=self.c["with_exact_time"], quintessence=self.c["with_quintessence"], with_uvmatch=self.c["with_uvmatch_2"], with_irmatch=self.c["with_irmatch_2"], 
+            exact_time=self.c["with_exact_time"], quintessence=self.c["with_quintessence"], with_uvmatch=self.c["with_uvmatch_2"], with_irmatch=self.c["with_irmatch_2"],
             with_tidal_alignments=self.c["with_tidal_alignments"], nonequaltime=self.c["with_common_nonequal_time"], keep_loop_pieces_independent=self.c["keep_loop_pieces_independent"])
         if load_engines:
             self.nonlinear = NonLinear(load=True, save=True, NFFT=256*self.c["fftaccboost"], fftbias=self.c["fftbias"], co=self.co)
@@ -574,6 +574,103 @@ class Correlator(object):
             if self.c["with_redshift_bin"]:
                 def comoving_distance(z): return M.angular_distance(z) * (1+z) * M.h()
                 cosmo["Dz"] = np.array([M.scale_independent_growth_factor(z) for z in self.c["redshift_bin_zz"]])
+                cosmo["fz"] = np.array([M.scale_independent_growth_factor_f(z) for z in self.c["redshift_bin_zz"]])
+                cosmo["rz"] = np.array([comoving_distance(z) for z in self.c["redshift_bin_zz"]])
+
+            if self.c["with_quintessence"]:
+                # starting deep inside matter domination and evolving to the total adiabatic linear power spectrum.
+                # This does not work in the general case, e.g. with massive neutrinos (okish for minimal mass though)
+                # This does not work for 'with_redshift_bin': True. # eventually to code up
+                zm = 5. # z in matter domination
+                def scale_factor(z): return 1/(1.+z)
+                Omega0_m = cosmo["Omega0_m"]
+                w = cosmo["w0_fld"]
+                GF = GreenFunction(Omega0_m, w=w, quintessence=True)
+                Dq = GF.D(scale_factor(zfid)) / GF.D(scale_factor(zm))
+                Dm = M.scale_independent_growth_factor(self.c["z"]) / M.scale_independent_growth_factor(zm)
+                cosmo["pk_lin"] *= Dq**2 / Dm**2 * ( 1 + (1+w)/(1.-3*w) * (1-Omega0_m)/Omega0_m * (1+zm)**(3*w) )**2 # 1611.07966 eq. (4.15)
+                cosmo["f"] = GF.fplus(1/(1.+self.c["z"]))
+
+            # wiggle-no-wiggle split # algo: 1003.3999; details: 2004.10607
+            def get_smooth_wiggle_resc(kk, pk, alpha_rs=1.): # k [h/Mpc], pk [(Mpc/h)**3]
+                kp = np.linspace(1.e-7, 7, 2**16)   # 1/Mpc
+                ilogpk = interp1d(np.log(kk * M.h()), np.log(pk / M.h()**3), fill_value="extrapolate") # Mpc**3
+                lnkpk = np.log(kp) + ilogpk(np.log(kp))
+                harmonics = dst(lnkpk, type=2, norm='ortho')
+                odd, even = harmonics[::2], harmonics[1::2]
+                nn = np.arange(0, odd.shape[0], 1)
+                nobao = np.delete(nn, np.arange(120, 240,1))
+                smooth_odd = interp1d(nn, odd, kind='cubic')(nobao)
+                smooth_even = interp1d(nn, even, kind='cubic')(nobao)
+                smooth_odd = interp1d(nobao, smooth_odd, kind='cubic')(nn)
+                smooth_even = interp1d(nobao, smooth_even, kind='cubic')(nn)
+                smooth_harmonics =  np.array([[o, e] for (o, e) in zip(smooth_odd, smooth_even)]).reshape(-1)
+                smooth_lnkpk = dst(smooth_harmonics, type=3, norm='ortho')
+                smooth_pk = np.exp(smooth_lnkpk) / kp
+                wiggle_pk = np.exp(ilogpk(np.log(kp))) - smooth_pk
+                spk = interp1d(kp, smooth_pk, bounds_error=False)(kk * M.h()) * M.h()**3 # (Mpc/h)**3
+                wpk_resc = interp1d(kp, wiggle_pk, bounds_error=False)(alpha_rs * kk * M.h()) * M.h()**3 # (Mpc/h)**3 # wiggle rescaling
+                kmask = np.where(kk < 1.02)[0]
+                return kk[kmask], spk[kmask], pk[kmask] #spk[kmask]+wpk_resc[kmask]
+
+            if self.c["with_nnlo_counterterm"]: cosmo["kk"], cosmo["Psmooth"], cosmo["pk_lin"] = get_smooth_wiggle_resc(cosmo["kk"], cosmo["pk_lin"])
+
+            return cosmo
+
+        if module == 'camb':
+
+            log10kmax = 0
+            if self.c["with_nnlo_counterterm"]: log10kmax = 1 # slower, but required for the wiggle-no-wiggle split scheme
+
+            if not engine:
+                import camb
+                from camb import model, initialpower
+                cosmo_dict_local = cosmo_dict.copy()
+                if self.c["with_bias"] and "bias" in cosmo_dict: del cosmo_dict_local["bias"] # remove to not pass it to classy that otherwise complains
+                if not self.c["with_time"] and "A" in cosmo_dict: del cosmo_dict_local["A"] # same as above
+                if self.c["with_redshift_bin"]: zmax = max(self.c["redshift_bin_zz"])
+                else: zmax = self.c["z"]
+                pars = camb.CAMBparams()
+                {'omega_b': 0.02235, 'omega_cdm': 0.120, 'h': 0.675, 'ln10^{10}A_s': 3.044, 'n_s': 0.965}
+                pars.set_cosmology(H0=100*cosmo_dict_local["h"], ombh2=cosmo_dict_local["omega_b"], omch2=cosmo_dict_local["omega_cdm"])
+                pars.InitPower.set_params(As=np.exp(cosmo_dict_local["ln10^{10}A_s"]*1e-10),
+                                          ns=cosmo_dict_local["n_s"])
+                #Note non-linear corrections couples to smaller scales than you want
+                pars.set_matter_power(redshifts=[self.c["z"]],
+                                      kmax=10.**log10kmax*cosmo_dict_local["h"])
+
+                #Linear spectra
+                pars.NonLinear = model.NonLinear_none
+                results = camb.get_results(pars)
+                kh, z, pk = results.get_matter_power_spectrum(minkh=1e-5*cosmo_dict_local["h"],
+                                                              maxkh=10.**log10kmax*cosmo_dict_local["h"], npoints = 200)
+                pk = pk[0,:]#slicing since camb retrieves a 2d array
+                s8 = np.array(results.get_sigma8())
+                data = camb.get_transfer_functions(pars)
+                delta_cdm_growth = data.get_redshift_evolution(0.01, [0.], ['delta_cdm'])[0,0]#worth checking...
+                f = data.get_fsigma8()/data.get_sigma8()
+            else: M = engine
+
+            cosmo["kk"] = kh  # k in h/Mpc
+            cosmo["pk_lin"] = pk # P(k) in (Mpc/h)**3
+
+            if self.c["multipole"] > 0: cosmo["f"] = f
+            if not self.c["with_time"]: cosmo["D"] = data.get_redshift_evolution(0.01, [self.c["z"]], ['delta_cdm'])[0,0]
+            if self.c["with_nonequal_time"]:
+                cosmo["D1"] = data.get_redshift_evolution(0.01, [self.c["z1"]], ['delta_cdm'])[0,0]
+                cosmo["D2"] = data.get_redshift_evolution(0.01, [self.c["z"]], ['delta_cdm'])[0,0]
+                cosmo["f1"] = f
+                cosmo["f2"] = f#actually wrong...
+            if self.c["with_exact_time"] or self.c["with_quintessence"]:
+                cosmo["z"] = self.c["z"]
+                cosmo["Omega0_m"] = results.get_Omega('cdm',z=0.)+results.get_Omega('baryon',z=0.)+results.get_Omega('nu',z=0.)
+                if "w0_fld" in cosmo_dict: cosmo["w0_fld"] = cosmo_dict["w0_fld"]#worth checking
+            if self.c["with_ap"]:
+                cosmo["H"], cosmo["DA"] = data.h_of_z(self.c["z"]) / (100*cosmo_dict_local["h"]), results.angular_diameter_distance(self.c["z"]) * (100*cosmo_dict_local["h"])
+
+            if self.c["with_redshift_bin"]:
+                def comoving_distance(z): return M.angular_distance(z) * (1+z) * M.h()
+                cosmo["Dz"] = np.array([data.get_redshift_evolution(0.01, [z], ['delta_cdm'])[0,0] for z in self.c["redshift_bin_zz"]])
                 cosmo["fz"] = np.array([M.scale_independent_growth_factor_f(z) for z in self.c["redshift_bin_zz"]])
                 cosmo["rz"] = np.array([comoving_distance(z) for z in self.c["redshift_bin_zz"]])
 
